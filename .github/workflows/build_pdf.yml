@@ -1,0 +1,37 @@
+name: Build PDF
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: converter/package-lock.json
+
+      - name: Install dependencies and build PDF
+        run: ./bootstrap.sh --run
+
+      - name: Upload PDF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: food-guide-pdf
+          path: food-guide-v*.pdf
+          if-no-files-found: error
