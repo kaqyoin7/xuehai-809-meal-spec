@@ -1,0 +1,17 @@
+# Node
+converter/node_modules/
+
+# Python venv
+.venv/
+
+.tools/
+
+# 输出 PDF
+*.pdf
+
+# 中间 HTML（--keep-html 产生）
+*.html
+!converter/*.js
+
+# 运行器（ bootstrap.sh 生成）
+run.sh
