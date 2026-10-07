@@ -7,7 +7,7 @@ converter/node_modules/
 .tools/
 
 # 输出 PDF
-*.pdf
+# *.pdf
 
 # 中间 HTML（--keep-html 产生）
 *.html

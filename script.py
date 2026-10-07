@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-将 819 食谱 Markdown 转换为 RFC / ISO / IETF 风格 PDF。
+809 食谱指南构建器：guide.toml + content/*.md → RFC 风格 PDF。
+
+管理方式参考 819-food-guide 项目（toml + 分目录 + 指令），渲染风格
+沿用本项目原 script.py 的 CSS / 封面 / 目录 / 正文管线。
 
 用法：
-    python3 RFC风格PDF生成脚本.py 819食谱.md -o 819食谱-RFC定稿.pdf
+    python3 script.py                   构建 PDF（默认输出 food-guide-v<version>.pdf）
+    python3 script.py --keep-html       同时保留中间 HTML
+    python3 script.py -o out.pdf        指定输出路径
+    python3 script.py new "店名"         在 entries/ 新建一条推荐
 
-默认从 Markdown 所在目录解析图片；如图片集中存放，可使用：
-    python3 RFC风格PDF生成脚本.py 819食谱.md -o out.pdf --asset-dir ./images
-
-依赖：Python 3、Pandoc、Node.js、Playwright/Chromium，以及本环境中的
-kimi-pdf HTML 转换器。脚本不改动源 Markdown，只在内存中做排版投影。
+依赖：Python 3.11+（或 tomli）、Pandoc、Node.js、Playwright/Chromium，
+以及 converter/ 子目录下的 html_to_pdf.js。
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import html
 import json
 import re
@@ -23,17 +27,30 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote, urlparse
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
-# 默认使用 converter/ 子目录下的 html_to_pdf.js（感谢 kimi）。
-# 该目录还应包含其依赖的 browser_helper.js、paged.polyfill.js 与 package.json。
-DEFAULT_CONVERTER = Path(__file__).resolve().parent / "converter" / "html_to_pdf.js"
+try:
+    import tomllib
+except ModuleNotFoundError:          # Python < 3.11
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        sys.exit("需要 Python 3.11+ 或安装 tomli：pip install tomli")
 
+ROOT = Path(__file__).resolve().parent
+DEFAULT_CONVERTER = ROOT / "converter" / "html_to_pdf.js"
+FIGURES_DIR = ROOT / "figures"
+ASSETS_DIR = ROOT / "assets"
+CONTENT_DIR = ROOT / "content"
+ENTRIES_DIR = ROOT / "entries"
+EXAMPLES_DIR = ROOT / "examples"
+
+# ============================================================================= CSS
+# 与原 script.py 完全一致——渲染风格的生命线。
 CSS_TEMPLATE = r"""
 @page {
     size: A4;
@@ -497,8 +514,8 @@ hr {
 """
 
 
+# ============================================================================= helpers
 def css_quote(value: str) -> str:
-    """Return a safe CSS string literal."""
     return json.dumps(value, ensure_ascii=False)
 
 
@@ -513,7 +530,7 @@ def path_to_file_uri(path: Path) -> str:
     return "file://" + quote(str(path.resolve()))
 
 
-def resolve_asset(name: str, asset_dir: Path) -> Optional[Path]:
+def resolve_asset(name: str, *dirs: Path) -> Optional[Path]:
     name = name.strip()
     if not name:
         return None
@@ -522,17 +539,198 @@ def resolve_asset(name: str, asset_dir: Path) -> Optional[Path]:
         return None
     candidate = Path(name)
     if not candidate.is_absolute():
-        candidate = asset_dir / candidate
-    try:
-        resolved = candidate.resolve()
-    except OSError:
-        return None
-    return resolved if resolved.exists() else None
+        for d in dirs:
+            if d is not None:
+                resolved = (d / name).resolve()
+                if resolved.exists():
+                    return resolved
+    else:
+        try:
+            resolved = candidate.resolve()
+            if resolved.exists():
+                return resolved
+        except OSError:
+            pass
+    return None
 
 
-def replace_obsidian_images(markdown_text: str, asset_dir: Path, warnings: List[str]) -> str:
-    """Convert Obsidian embeds to HTML figures, preserving missing embeds as text."""
+# ============================================================================= toml + front matter
+def load_meta() -> Dict[str, str]:
+    with open(ROOT / "guide.toml", "rb") as f:
+        data = tomllib.load(f)
+    meta: Dict[str, str] = {
+        "title": "<br>".join(data.get("title_lines", [])),
+        "subtitle": data.get("subtitle", ""),
+        "Version": data.get("version", ""),
+        "Date": data.get("date", ""),
+        "Maintainers": data.get("maintainers", ""),
+        "Status": data.get("status", ""),
+        "Request": data.get("rfc_number", ""),
+        "Category": data.get("category", ""),
+        "Organization": data.get("location", ""),
+        "authors": data.get("authors", ""),
+        "month_year": data.get("month_year", ""),
+        "quote": data.get("quote", ""),
+        "quote_author": data.get("quote_author", ""),
+    }
+    return meta
 
+
+def read_front_matter(path: Path) -> Tuple[Dict[str, str], str]:
+    """Parse simple YAML-like front matter (key: value lines between --- ... ---)."""
+    text = path.read_text(encoding="utf-8")
+    meta: Dict[str, str] = {}
+    body = text
+    if text.startswith("---\n"):
+        end = text.find("\n---", 4)
+        if end != -1:
+            head, body = text[4:end], text[end + 4:].lstrip("\n")
+            for line in head.splitlines():
+                s = line.strip()
+                if not s or s.startswith("#") or ":" not in s:
+                    continue
+                k, v = s.split(":", 1)
+                v = re.sub(r"\s+#.*$", "", v).strip()
+                if v:
+                    meta[k.strip()] = v
+    return meta, body
+
+
+# ============================================================================= directive expansion + card rendering
+def figure_html_tag(name: str, width: str, caption: str, fig_no: int) -> str:
+    """Render a figure as raw HTML (Pandoc passes it through)."""
+    resolved = resolve_asset(name, FIGURES_DIR, ASSETS_DIR)
+    if resolved is None:
+        return f"<!-- 图片未找到：{name} -->"
+    src = path_to_file_uri(resolved)
+    style = f"width:{width};" if width else ""
+    cap = f'<p class="figure-caption">Figure {fig_no} — {html.escape(caption, quote=False)}</p>' if caption else ""
+    return (
+        f'<figure class="source-figure">'
+        f'<div class="image-frame">'
+        f'<img src="{src}" alt="{html.escape(name)}" style="{style}" />'
+        f"</div>"
+        f"</figure>"
+        f"\n{cap}"
+    )
+
+
+def card_markdown(fm: Dict[str, str], body: str, show_no: bool = True) -> str:
+    """Render an example/entry card as Markdown blockquote (matches 809.md style)."""
+    head: List[str] = []
+    if fm.get("no") and show_no:
+        head.append("No.%s" % fm["no"])
+    for k in ("name", "type", "where"):
+        if fm.get(k):
+            head.append(fm[k])
+    lines: List[str] = []
+    if head:
+        lines.append("> **%s**" % "　".join(head))
+    for line in body.splitlines():
+        if line.strip():
+            lines.append("> %s" % line.strip())
+    if fm.get("by"):
+        who = "推荐人：%s" % fm["by"]
+        if fm.get("date"):
+            who += "　%s" % fm["date"]
+        lines.append("> %s" % who)
+    if fm.get("status") == "retired":
+        lines.append("> 状态：已停止推荐（%s）" % fm.get("retired_note", ""))
+    return "\n".join(lines)
+
+
+def card_with_figure_markdown(fm: Dict[str, str], body: str, show_no: bool, fig_no: int) -> str:
+    card = card_markdown(fm, body, show_no)
+    parts = [card]
+    if fm.get("figure"):
+        parts.append("")
+        parts.append(figure_html_tag(
+            fm["figure"],
+            fm.get("figure_width", ""),
+            fm.get("figure_caption", ""),
+            fig_no,
+        ))
+    return "\n".join(parts)
+
+
+def examples_markdown(fig_counter: List[int]) -> str:
+    parts: List[str] = []
+    show_no = True  # guide.toml 的 show_example_numbers 默认 true
+    for p in sorted(EXAMPLES_DIR.glob("*.md")):
+        if p.name.startswith("_"):
+            continue
+        fm, body = read_front_matter(p)
+        parts.append("\n### %s\n" % fm.get("heading", p.stem))
+        fig_counter[0] += 1
+        parts.append(card_with_figure_markdown(fm, body, show_no, fig_counter[0]))
+    return "\n".join(parts)
+
+
+def entries_markdown(fig_counter: List[int]) -> str:
+    parts: List[str] = ["\n### 推荐列表\n"]
+    files = [p for p in ENTRIES_DIR.glob("*.md") if not p.name.startswith("_")]
+
+    def key(p):
+        fm, _ = read_front_matter(p)
+        return (int(fm["no"]) if fm.get("no", "").isdigit() else 10 ** 9, p.name)
+
+    files.sort(key=key)
+    if not files:
+        parts.append("\n【新的推荐从这里开始，按编号往后追加。】\n")
+    for p in files:
+        fm, body = read_front_matter(p)
+        fig_counter[0] += 1
+        parts.append(card_with_figure_markdown(fm, body, True, fig_counter[0]))
+    return "\n".join(parts)
+
+
+def expand_directives(text: str, fig_counter: List[int]) -> str:
+    """Expand @examples / @entries / @pagebreak / @split / Table: / Figure:."""
+    out: List[str] = []
+    for line in text.split("\n"):
+        s = line.strip()
+        if s == "@split":
+            out.append("")  # soft break hint; our CSS handles keep-together
+        elif s == "@pagebreak":
+            out.append('\n<div style="page-break-after: always;"></div>\n')
+        elif s == "@examples":
+            out.append(examples_markdown(fig_counter))
+        elif s == "@entries":
+            out.append(entries_markdown(fig_counter))
+        elif s.startswith("Table:"):
+            # Strip — let postprocess_body auto-caption h3+table pairs.
+            pass
+        elif s.startswith("Figure:"):
+            parts = [x.strip() for x in s[7:].split("|")]
+            name = parts[0] if len(parts) > 0 else ""
+            width = parts[1] if len(parts) > 1 else ""
+            cap = parts[2] if len(parts) > 2 else ""
+            fig_counter[0] += 1
+            out.append("\n" + figure_html_tag(name, width, cap, fig_counter[0]) + "\n")
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+# ============================================================================= Markdown preprocessing
+def demote_headings(text: str) -> str:
+    """content/*.md uses # / ##; demote to ## / ### to match the rendering pipeline."""
+    lines = text.splitlines()
+    out: List[str] = []
+    for line in lines:
+        # Match heading lines, possibly with trailing {: .attr }
+        m = re.match(r"^(#{1,2})\s+(.*)$", line)
+        if m:
+            level = len(m.group(1))
+            rest = m.group(2)
+            out.append("#" * (level + 1) + " " + rest)
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def replace_obsidian_images(markdown_text: str, warnings: List[str]) -> str:
+    """Convert ![[file]] embeds to HTML figures."""
     pattern = re.compile(r"!\[\[([^\]\n]+)\]\]")
 
     def repl(match: re.Match[str]) -> str:
@@ -544,13 +742,11 @@ def replace_obsidian_images(markdown_text: str, asset_dir: Path, warnings: List[
             width_match = re.search(r"\d+", parts[1])
             if width_match:
                 width = width_match.group(0)
-
-        resolved = resolve_asset(filename, asset_dir)
+        resolved = resolve_asset(filename, FIGURES_DIR, ASSETS_DIR)
         if resolved is None:
             warnings.append(f"图片未找到，已保留原始引用：![[{raw}]]")
             return html.escape(match.group(0))
-
-        style = f'width: {width}px;' if width else ""
+        style = f"width: {width}px;" if width else ""
         return (
             '\n\n<figure class="source-figure">'
             '<div class="image-frame">'
@@ -560,66 +756,6 @@ def replace_obsidian_images(markdown_text: str, asset_dir: Path, warnings: List[
         )
 
     return pattern.sub(repl, markdown_text)
-
-
-def extract_cover(markdown_text: str) -> Tuple[Dict[str, str], str, str]:
-    """Extract title, metadata, and leading blockquote without changing their text."""
-    lines = markdown_text.splitlines()
-    meta: Dict[str, str] = {
-        "title": "A Handbook for The Deadline-Driven and Dying of Hunger",
-        "subtitle": "Food Guide",
-        "Version": "1.0.0",
-        "Date": "",
-        "Maintainers": "XueHai 819ers",
-        "Status": "Open for Contributions",
-        "Request": "819",
-        "Category": "Informational",
-        "Organization": "WHUT Xuehai Building",
-    }
-
-    i = 0
-    while i < len(lines) and not lines[i].strip():
-        i += 1
-
-    if i < len(lines):
-        title_match = re.match(r"^##\s+\*\*(.*?)\*\*\s*$", lines[i])
-        if title_match:
-            meta["title"] = strip_markdown_inline(title_match.group(1))
-            i += 1
-
-    # The source separates title and metadata with a blank line.
-    while i < len(lines) and not lines[i].strip():
-        i += 1
-
-    # Read contiguous front-matter-like lines up to the first blank line.
-    while i < len(lines) and lines[i].strip():
-        line = lines[i].strip()
-        key_value = re.match(r"^(Version|Date|Maintainers|Status)\s*:\s*(.*)$", line)
-        if key_value:
-            meta[key_value.group(1)] = key_value.group(2).strip()
-        elif not line.startswith(">"):
-            meta["subtitle"] = line
-        i += 1
-
-    while i < len(lines) and not lines[i].strip():
-        i += 1
-
-    preface_lines: List[str] = []
-    if i < len(lines) and lines[i].lstrip().startswith(">"):
-        while i < len(lines):
-            line = lines[i]
-            if line.lstrip().startswith(">"):
-                preface_lines.append(line)
-                i += 1
-            elif not line.strip():
-                # A plain blank line terminates the cover preface.
-                break
-            else:
-                break
-
-    body = "\n".join(lines[i:]).lstrip("\n")
-    preface = "\n".join(preface_lines)
-    return meta, preface, body
 
 
 def group_guideline_blockquote(markdown_text: str) -> str:
@@ -640,61 +776,53 @@ def group_guideline_blockquote(markdown_text: str) -> str:
     return "\n".join(out)
 
 
-def normalize_headings(markdown_text: str) -> str:
-    """Map document-specific Markdown conventions to h2/h3 while retaining text."""
-    lines = markdown_text.splitlines()
-    out: List[str] = []
-    current_top = ""
+# ============================================================================= Pandoc
+def preprocess_attr_blocks(markdown_text: str) -> str:
+    """Convert Pandoc-style `{: .class }` attribute blocks into raw HTML.
 
-    def next_nonblank(index: int) -> str:
-        for j in range(index + 1, len(lines)):
-            if lines[j].strip():
-                return lines[j].strip()
-        return ""
+    Pandoc 3.6.4's `markdown` format doesn't enable `attr_list`, so we
+    preprocess:
+      - Heading lines trailing `{: .nonum }` → compact `{#auto-N .nonum}`
+        syntax that Pandoc's `header_attributes` (on by default) understands.
+      - Standalone `{: .class }` lines attach class to the previous paragraph:
+        the paragraph becomes <p class="class">...</p> (raw HTML, kept).
+    """
+    counter = [0]
 
-    def append_heading(level: int, text: str) -> None:
-        # Pandoc's hard-line-break mode needs an explicit blank line when a
-        # heading follows a caption/paragraph without one in the source.
-        if out and out[-1].strip():
-            out.append("")
-        out.append("#" * level + " " + text)
+    # Heading attribute: `# Title {: .nonum }` → `# Title {#auto-N .nonum}`
+    def repl_heading(match: re.Match[str]) -> str:
+        counter[0] += 1
+        return f'{match.group(1)} {{#auto-{counter[0]} .{match.group(2)}}}'
 
-    for index, line in enumerate(lines):
-        stripped = line.strip()
+    markdown_text = re.sub(
+        r"^(#{1,2}\s+.+?)\s*\{: *\.([a-zA-Z0-9_-]+)\s*\}\s*$",
+        repl_heading,
+        markdown_text,
+        flags=re.MULTILINE,
+    )
 
-        h4 = re.match(r"^####\s+(.+?)\s*$", stripped)
-        h5 = re.match(r"^#####\s+(.+?)\s*$", stripped)
-        bold_only = re.match(r"^\*\*([^*]+)\*\*\s*$", stripped)
-
-        if h4:
-            text = h4.group(1)
-            plain = strip_markdown_inline(text)
-            if current_top == "推荐 Recommendations" and plain == "推荐列表":
-                append_heading(3, text)
-            else:
-                current_top = plain
-                append_heading(2, text)
-            continue
-
-        if h5:
-            append_heading(3, h5.group(1))
-            continue
-
-        if bold_only:
-            text = bold_only.group(1).strip()
-            nxt = next_nonblank(index)
-            promote = (
-                text.startswith("Example")
-                or nxt.startswith("|")
-                or current_top.startswith("Food Integrity")
+    # Standalone `{: .class }` line attaches to the previous paragraph:
+    # wrap the previous line (single-line paragraph) with <p class="class">.
+    def repl_block(match: re.Match[str]) -> str:
+        para = match.group("para").strip()
+        cls = match.group(2)
+        if para.startswith("<") and para.endswith(">"):
+            return re.sub(
+                r"^<([a-zA-Z][a-zA-Z0-9]*)",
+                rf'<\1 class="{cls}"',
+                para,
+                count=1,
             )
-            if promote:
-                append_heading(3, text)
-                continue
+        return f'<p class="{cls}">{para}</p>'
 
-        out.append(line)
+    markdown_text = re.sub(
+        r"^(?P<para>[^\n>].*?)\n\{: *\.([a-zA-Z0-9_-]+)\s*\}\s*$",
+        repl_block,
+        markdown_text,
+        flags=re.MULTILINE,
+    )
 
-    return "\n".join(out)
+    return markdown_text
 
 
 def run_pandoc(markdown_text: str) -> str:
@@ -719,6 +847,7 @@ def run_pandoc(markdown_text: str) -> str:
     return proc.stdout
 
 
+# ============================================================================= Post-processing (HTML)
 def next_element(tag: Tag) -> Optional[Tag]:
     node = tag.next_sibling
     while node is not None:
@@ -730,50 +859,75 @@ def next_element(tag: Tag) -> Optional[Tag]:
     return None
 
 
-def postprocess_body(body_html: str, asset_dir: Path) -> Tuple[str, str]:
+def postprocess_body(body_html: str) -> Tuple[str, str]:
     soup = BeautifulSoup(f'<div id="markdown-root">{body_html}</div>', "lxml")
     root = soup.find("div", id="markdown-root")
     if root is None:
         raise RuntimeError("Markdown HTML 后处理失败")
 
-    # Resolve ordinary relative Markdown images against the asset directory.
+    # Resolve ordinary relative Markdown images against figures/ and assets/.
     for img in root.find_all("img"):
         src = img.get("src", "")
         if not src or urlparse(src).scheme in {"http", "https", "file", "data"}:
             continue
-        resolved = resolve_asset(src, asset_dir)
+        resolved = resolve_asset(src, FIGURES_DIR, ASSETS_DIR)
         if resolved is not None:
             img["src"] = path_to_file_uri(resolved)
 
-    # Number sections and collect TOC entries before heading content is changed.
+    # Convert <p class="note"> starting with "Adapted from:" into blockquote.attribution
+    # (food-guide content uses {: .note } attribute instead of > blockquote).
+    for p in root.find_all("p"):
+        classes = p.get("class") or []
+        text = p.get_text(" ", strip=True)
+        if "note" in classes and text.startswith("Adapted from:"):
+            bq = soup.new_tag("blockquote", attrs={"class": "attribution"})
+            for child in list(p.children):
+                bq.append(child.extract())
+            p.replace_with(bq)
+
+    # Number sections and collect TOC entries.
     toc_items: List[Tuple[int, str, str]] = []
     top_no = 0
     sub_no = 0
     table_no = 0
 
     for heading in list(root.find_all(["h2", "h3"])):
+        classes = heading.get("class") or []
         original_inner = heading.decode_contents()
         original_text = heading.get_text(" ", strip=True)
+        is_nonum = "nonum" in classes
 
         if heading.name == "h2":
-            top_no += 1
-            sub_no = 0
-            number = f"{top_no}."
-            anchor = f"sec-{top_no}"
-            level = 1
+            if is_nonum:
+                number = ""
+                anchor = f"sec-nonum-{len(toc_items)}"
+                level = 1
+            else:
+                top_no += 1
+                sub_no = 0
+                number = f"{top_no}."
+                anchor = f"sec-{top_no}"
+                level = 1
         else:
-            sub_no += 1
-            number = f"{top_no}.{sub_no}"
-            anchor = f"sec-{top_no}-{sub_no}"
-            level = 2
+            if is_nonum:
+                number = ""
+                anchor = f"sec-nonum-{len(toc_items)}"
+                level = 2
+            else:
+                sub_no += 1
+                number = f"{top_no}.{sub_no}"
+                anchor = f"sec-{top_no}-{sub_no}"
+                level = 2
 
         heading["id"] = anchor
-        number_span = soup.new_tag("span", attrs={"class": "secno"})
-        number_span.string = number
-        heading.insert(0, number_span)
-        heading.insert(1, " ")
-        toc_label_inner = re.sub(r"</?(?:strong|b)>", "", original_inner)
-        toc_label = f'<span class="secno">{number}</span> {toc_label_inner}'
+        if number:
+            number_span = soup.new_tag("span", attrs={"class": "secno"})
+            number_span.string = number
+            heading.insert(0, number_span)
+            heading.insert(1, " ")
+            toc_label = f'<span class="secno">{number}</span> {original_inner}'
+        else:
+            toc_label = original_inner
         toc_items.append((level, anchor, toc_label))
 
         sibling = next_element(heading)
@@ -782,10 +936,6 @@ def postprocess_body(body_html: str, asset_dir: Path) -> Tuple[str, str]:
             caption = soup.new_tag("div", attrs={"class": "table-caption"})
             caption.string = f"Table {table_no} — {original_text}"
             sibling.insert_before(caption)
-
-            # Keep a small subsection heading, its caption, and its table as
-            # one atomic RFC-style block, avoiding an orphaned heading at a
-            # page bottom. Very large tables remain paginable.
             if len(sibling.find_all("tr")) <= 10:
                 block = soup.new_tag("div", attrs={"class": "heading-table-block"})
                 heading.insert_before(block)
@@ -793,11 +943,9 @@ def postprocess_body(body_html: str, asset_dir: Path) -> Tuple[str, str]:
                 block.append(caption.extract())
                 block.append(sibling.extract())
 
-    # Table defaults.
     for table in root.find_all("table"):
         table["class"] = (table.get("class") or []) + ["data-table"]
 
-    # Classify blockquotes for RFC-style cards.
     for quote_tag in root.find_all("blockquote"):
         text = quote_tag.get_text(" ", strip=True)
         classes = quote_tag.get("class") or []
@@ -811,9 +959,10 @@ def postprocess_body(body_html: str, asset_dir: Path) -> Tuple[str, str]:
             classes.append("recommendation")
         else:
             classes.append("note")
-        quote_tag["class"] = classes
+        # Dedupe while preserving order.
+        seen = set()
+        quote_tag["class"] = [c for c in classes if not (c in seen or seen.add(c))]
 
-    # Treat a short parenthesized paragraph immediately after a figure as a caption.
     for figure in root.find_all("figure"):
         sibling = next_element(figure)
         if sibling is not None and sibling.name == "p":
@@ -832,16 +981,32 @@ def postprocess_body(body_html: str, asset_dir: Path) -> Tuple[str, str]:
     return str(root), "\n".join(toc_html_parts)
 
 
-def build_preface(preface_md: str) -> str:
+# ============================================================================= Cover + preface + full HTML
+def build_preface(meta: Dict[str, str]) -> str:
+    """Assemble preface blockquote from guide.toml quote + content/_intro.md."""
+    intro_path = CONTENT_DIR / "_intro.md"
+    intro_text = intro_path.read_text(encoding="utf-8") if intro_path.exists() else ""
+
+    quote = meta.get("quote", "")
+    quote_author = meta.get("quote_author", "")
+
+    lines: List[str] = []
+    if quote:
+        lines.append(f'> *"{quote}"*')
+        lines.append(">")
+        if quote_author:
+            lines.append(f"> —— {quote_author}")
+        lines.append(">")
+    for line in intro_text.splitlines():
+        if line.strip():
+            lines.append("> " + line.strip())
+        else:
+            lines.append(">")
+
+    preface_md = "\n".join(lines)
     if not preface_md.strip():
         return ""
-    # Separate quote attribution and the following Chinese preface onto distinct
-    # visual paragraphs, as in the reference cover.
-    preface_md = re.sub(
-        r"\n>\s*——\s*([^\n]+)\n>",
-        r"\n>\n> —— \1\n>\n>",
-        preface_md,
-    )
+
     preface_html = run_pandoc(preface_md)
     soup = BeautifulSoup(preface_html, "lxml")
     quote_tag = soup.find("blockquote")
@@ -851,16 +1016,16 @@ def build_preface(preface_md: str) -> str:
     paragraphs = quote_tag.find_all("p")
     if paragraphs:
         paragraphs[0]["class"] = (paragraphs[0].get("class") or []) + ["opening-quote"]
-    if len(paragraphs) > 1 and "M.F.K. Fisher" in paragraphs[1].get_text():
+    if len(paragraphs) > 1 and quote_author and quote_author in paragraphs[1].get_text():
         paragraphs[1]["class"] = (paragraphs[1].get("class") or []) + ["quote-source"]
     return str(quote_tag)
 
 
-def month_year(date_text: str) -> str:
+def month_year(date_text: str, fallback: str = "") -> str:
     try:
         return datetime.strptime(date_text, "%Y-%m-%d").strftime("%B %Y")
     except ValueError:
-        return date_text or "October 2026"
+        return fallback or date_text or "October 2026"
 
 
 def build_cover(meta: Dict[str, str], preface_html: str) -> str:
@@ -874,21 +1039,23 @@ def build_cover(meta: Dict[str, str], preface_html: str) -> str:
         f"<tr><td>{html.escape(label)}</td><td>{html.escape(value)}</td></tr>"
         for label, value in rows
     )
+    title_html = meta.get("title", "")
+    my = meta.get("month_year") or month_year(meta.get("Date", ""))
     return f"""
 <div class="cover">
     <div class="rfc-head">
         <div class="left">
-            {html.escape(meta.get('Maintainers', 'XueHai 819ers'))}<br />
-            Request for Comments: {html.escape(meta.get('Request', '819'))}<br />
+            {html.escape(meta.get('authors', meta.get('Maintainers', 'XueHai 809ers')))}<br />
+            Request for Comments: {html.escape(meta.get('Request', '809'))}<br />
             Category: {html.escape(meta.get('Category', 'Informational'))}
         </div>
         <div class="right">
             {html.escape(meta.get('Organization', 'WHUT Xuehai Building'))}<br />
-            {html.escape(month_year(meta.get('Date', '')))}
+            {html.escape(my)}
         </div>
     </div>
     <div class="head-rule"></div>
-    <h1 class="cover-title">{html.escape(meta.get('title', ''))}</h1>
+    <h1 class="cover-title">{title_html}</h1>
     <div class="cover-subtitle">{html.escape(meta.get('subtitle', ''))}</div>
     <table class="cover-meta">
         <tbody>
@@ -934,6 +1101,7 @@ def build_full_html(meta: Dict[str, str], body_html: str, toc_html: str, preface
 """
 
 
+# ============================================================================= HTML → PDF
 def convert_html_to_pdf(html_path: Path, pdf_path: Path, converter: Path) -> None:
     if not converter.exists():
         raise FileNotFoundError(
@@ -947,62 +1115,97 @@ def convert_html_to_pdf(html_path: Path, pdf_path: Path, converter: Path) -> Non
         raise RuntimeError(f"HTML→PDF 转换失败，退出码 {proc.returncode}")
 
 
+# ============================================================================= CLI
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="将 819 食谱 Markdown 转换为固定 RFC 风格 PDF。"
+        description="809 食谱指南构建器：guide.toml + content/*.md → RFC 风格 PDF。"
     )
-    parser.add_argument("input", type=Path, help="输入 Markdown 文件")
     parser.add_argument(
         "-o",
         "--output",
         type=Path,
-        help="输出 PDF；默认：<输入名>-RFC风格.pdf",
-    )
-    parser.add_argument(
-        "--asset-dir",
-        type=Path,
-        help="图片资源目录；默认为 Markdown 所在目录",
+        help="输出 PDF；默认：food-guide-v<version>.pdf",
     )
     parser.add_argument(
         "--converter",
         type=Path,
         default=DEFAULT_CONVERTER,
-        help="html_to_pdf.js 路径；默认为脚本同目录下的 html_to_pdf.js",
+        help="html_to_pdf.js 路径；默认为 converter/html_to_pdf.js",
     )
     parser.add_argument(
         "--keep-html",
         action="store_true",
         help="同时保留中间 HTML，便于调试版式",
     )
+    sub = parser.add_subparsers(dest="cmd")
+    n = sub.add_parser("new", help="在 entries/ 新建一条推荐")
+    n.add_argument("name")
     return parser.parse_args(argv)
 
 
-def main(argv: Optional[Iterable[str]] = None) -> int:
-    args = parse_args(argv)
-    input_path = args.input.expanduser().resolve()
-    if not input_path.exists():
-        print(f"错误：输入文件不存在：{input_path}", file=sys.stderr)
-        return 2
-
-    output_path = args.output.expanduser().resolve() if args.output else input_path.with_name(
-        f"{input_path.stem}-RFC风格.pdf"
+def new_entry(name: str) -> int:
+    nums: List[int] = []
+    for p in ENTRIES_DIR.glob("*.md"):
+        if p.name.startswith("_"):
+            continue
+        fm, _ = read_front_matter(p)
+        if fm.get("no", "").isdigit():
+            nums.append(int(fm["no"]))
+    no = max(nums) + 1 if nums else 1
+    path = ENTRIES_DIR / ("%04d.md" % no)
+    path.write_text(
+        "---\n"
+        "no: %d\n"
+        "name: %s\n"
+        "type: 堂食\n"
+        "where:\n"
+        "by:\n"
+        "date: %s\n"
+        "---\n"
+        "点评：\n" % (no, name, datetime.date.today().isoformat()),
+        encoding="utf-8",
     )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    print("Created %s  (see entries/_template.md for all fields)" % path.relative_to(ROOT))
+    return 0
 
-    asset_dir = (args.asset_dir.expanduser().resolve() if args.asset_dir else input_path.parent)
+
+def build(args) -> int:
+    meta = load_meta()
     warnings: List[str] = []
 
-    source = input_path.read_text(encoding="utf-8")
-    meta, preface_md, body_md = extract_cover(source)
+    # Walk content/*.md in filename order, expand directives.
+    chunks: List[str] = []
+    fig_counter = [0]  # mutable counter for figure auto-numbering
+    for p in sorted(CONTENT_DIR.glob("*.md")):
+        if p.name.startswith("_"):
+            continue
+        text = p.read_text(encoding="utf-8")
+        text = expand_directives(text, fig_counter)
+        chunks.append(text)
+    body_md = "\n\n".join(chunks)
 
+    # Pre-process Markdown: attr blocks, demote headings, group guideline blockquote, resolve images.
+    body_md = preprocess_attr_blocks(body_md)
+    body_md = demote_headings(body_md)
     body_md = group_guideline_blockquote(body_md)
-    body_md = replace_obsidian_images(body_md, asset_dir, warnings)
-    body_md = normalize_headings(body_md)
+    body_md = replace_obsidian_images(body_md, warnings)
 
+    # Run Pandoc.
     body_html_raw = run_pandoc(body_md)
-    body_html, toc_html = postprocess_body(body_html_raw, asset_dir)
-    preface_html = build_preface(preface_md)
+    body_html, toc_html = postprocess_body(body_html_raw)
+
+    # Preface.
+    preface_html = build_preface(meta)
+
+    # Full HTML.
     full_html = build_full_html(meta, body_html, toc_html, preface_html)
+
+    # Output path.
+    if args.output:
+        output_path = args.output.expanduser().resolve()
+    else:
+        output_path = ROOT / f"food-guide-v{meta.get('Version', '0')}.pdf"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if args.keep_html:
         html_path = output_path.with_suffix(".html")
@@ -1017,32 +1220,32 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             dir=str(output_path.parent),
             delete=False,
         )
-        with tmp:
-            tmp.write(full_html)
+        tmp.write(full_html)
+        tmp.close()
         html_path = Path(tmp.name)
         cleanup_html = True
 
     try:
-        convert_html_to_pdf(html_path, output_path, args.converter.expanduser().resolve())
+        convert_html_to_pdf(html_path, output_path, args.converter)
     finally:
         if cleanup_html:
             try:
                 html_path.unlink()
-            except FileNotFoundError:
+            except OSError:
                 pass
 
-    for warning in warnings:
-        print(f"警告：{warning}", file=sys.stderr)
-    print(f"PDF 已生成：{output_path}")
-    if args.keep_html:
-        print(f"中间 HTML：{html_path}")
+    for w in warnings:
+        print(f"WARNING: {w}", file=sys.stderr)
+    print(f"Built {output_path.name} ({output_path.stat().st_size // 1024} KB)")
     return 0
 
 
-if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except Exception as exc:
-        print(f"错误：{exc}", file=sys.stderr)
-        raise SystemExit(1)
+def main(argv: Optional[Iterable[str]] = None) -> int:
+    args = parse_args(argv)
+    if args.cmd == "new":
+        return new_entry(args.name)
+    return build(args)
 
+
+if __name__ == "__main__":
+    sys.exit(main())

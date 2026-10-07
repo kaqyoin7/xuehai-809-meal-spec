@@ -1,0 +1,23 @@
+# 全局信息：封面、页眉页脚、目录都从这里取值。改版本号只需要改这里。
+
+title_lines = ["A Handbook for The Deadline-Driven", "and Dying of Hunger"]
+subtitle = "学海楼809餐饮选择规范：关于饥饿问题的若干建议"
+rfc_number = "809"
+category = "Informational"
+authors = "XueHai 809ers"
+location = "WHUT Xuehai Building"
+month_year = "October 2026"
+version = "1.0.0"
+date = "2026-10-06"
+maintainers = "XueHai 809ers"
+status = "Open for Contributions"
+quote = "First we eat, then we do everything else."
+quote_author = "M.F.K. Fisher"
+copyright_year = "2026"
+copyright_holder = "WHUT Xuehai 809 Contributors"
+
+# 渲染器：auto（有 wkhtmltopdf 用它，否则用 Chromium）| wkhtmltopdf | chromium
+renderer = "auto"
+
+# 示例卡片是否显示 No. 编号（示例的 No.1/No.2 会和真实推荐的编号重复，见 README）
+show_example_numbers = true

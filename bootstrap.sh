@@ -14,7 +14,7 @@
 #
 # 用法：
 #   ./bootstrap.sh            # 安装依赖
-#   ./bootstrap.sh --run      # 安装后顺带跑 script.py 819.md
+#   ./bootstrap.sh --run      # 安装后顺带跑 script.py
 
 set -euo pipefail
 
@@ -155,6 +155,7 @@ log "生成 run.sh（用项目内 venv + 项目内 pandoc 调用 script.py）"
 cat > "$SCRIPT_DIR/run.sh" <<'EOF'
 #!/usr/bin/env bash
 # run.sh — 用项目本地 venv 与 pandoc 运行 script.py
+# 内容源固定为 guide.toml + content/*.md（详见 script.py）
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -164,19 +165,7 @@ export PATH="__TOOLS_DIR__/pandoc/bin:$PATH"
 export HOME="${HOME:-__HOME__}"
 
 PY="__VENV_DIR__/bin/python"
-MD="${1:-819.md}"
-OUT="${2:-}"
-ASSET_DIR="$SCRIPT_DIR/assets"
-
-# 默认从项目根 assets/ 解析图片，可用 --asset-dir 覆盖。
-# 若用户第二个参数以 - 开头（视作 flag），则不强制 -o。
-# 用 bash 数组避免空 "${@:3}" 被 argparse 当成空位置参数。
-if [ -n "$OUT" ] && [[ "$OUT" != -* ]]; then
-    set -- "$MD" -o "$OUT" --asset-dir "$ASSET_DIR" "${@:3}"
-else
-    set -- "$MD" --asset-dir "$ASSET_DIR" $OUT "${@:3}"
-fi
-"$PY" script.py "$@"
+"$PY" "$SCRIPT_DIR/script.py" "$@"
 EOF
 sed -i \
     -e "s#__TOOLS_DIR__#$TOOLS_DIR#g" \
@@ -186,8 +175,10 @@ sed -i \
 chmod +x "$SCRIPT_DIR/run.sh"
 
 log "完成。运行方式："
-echo "    ./run.sh 819.md                  # 默认输出 819-RFC风格.pdf"
-echo "    ./run.sh 819.md -o out.pdf        # 指定输出"
+echo "    ./run.sh                        # 默认输出 food-guide-v<version>.pdf"
+echo "    ./run.sh --keep-html            # 同时保留中间 HTML"
+echo "    ./run.sh -o out.pdf             # 指定输出"
+echo "    ./run.sh new \"店名\"            # 在 entries/ 新建一条推荐"
 echo
 echo "本次安装位置（卸载直接删即可）："
 echo "    $VENV_DIR"
@@ -198,6 +189,6 @@ echo "    $FONTS_DIR  (CJK 字体)"
 
 # 可选：安装后直接跑一次
 if [ "${1:-}" = "--run" ]; then
-    log "运行 script.py 819.md"
-    "$SCRIPT_DIR/run.sh" 819.md
+    log "运行 script.py"
+    "$SCRIPT_DIR/run.sh"
 fi
