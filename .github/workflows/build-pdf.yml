@@ -1,0 +1,132 @@
+name: Build PDF
+
+# 触发时机：
+#   1. push 到 main（含 PR 合并后 GitHub 自动触发的 push 事件）
+#   2. 针对 main 的 PR（仅构建检查，不回写 PDF）
+# 只在内容/脚本/工作流变化时跑，避免 PDF 反向 commit 引起循环。
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'content/**'
+      - 'entries/**'
+      - 'examples/**'
+      - 'figures/**'
+      - 'assets/**'
+      - 'guide.toml'
+      - 'CHANGELOG.md'
+      - 'script.py'
+      - 'converter/**'
+      - 'bootstrap.sh'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'content/**'
+      - 'entries/**'
+      - 'examples/**'
+      - 'figures/**'
+      - 'assets/**'
+      - 'guide.toml'
+      - 'CHANGELOG.md'
+      - 'script.py'
+      - 'converter/**'
+      - 'bootstrap.sh'
+      - '.github/workflows/**'
+
+permissions:
+  contents: write  
+
+concurrency:
+  group: build-pdf-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: converter/package.json
+
+      - name: Cache pandoc
+        uses: actions/cache@v4
+        with:
+          path: .tools/pandoc
+          key: pandoc-3.6.4-linux-amd64
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('converter/package.json') }}
+
+      - name: Install pandoc (cached or download)
+        run: |
+          if [ -x .tools/pandoc/bin/pandoc ]; then
+            echo "Using cached pandoc"
+          else
+            mkdir -p .tools
+            tmp="$(mktemp -d)"
+            curl -fsSL -o "$tmp/pandoc.tar.gz" \
+              https://github.com/jgm/pandoc/releases/download/3.6.4/pandoc-3.6.4-linux-amd64.tar.gz
+            tar -xzf "$tmp/pandoc.tar.gz" -C "$tmp"
+            rm -rf .tools/pandoc
+            mv "$tmp/pandoc-3.6.4" .tools/pandoc
+            rm -rf "$tmp"
+          fi
+          echo "$PWD/.tools/pandoc/bin" >> $GITHUB_PATH
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install beautifulsoup4 lxml
+
+      - name: Install npm deps
+        run: |
+          cd converter
+          npm install --no-audit --no-fund
+
+      - name: Install Playwright Chromium with system deps
+        run: |
+          cd converter
+          npx playwright install --with-deps chromium
+
+      - name: Install CJK fonts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y fonts-noto-cjk fonts-noto-cjk-extra
+
+      - name: Build PDF
+        run: |
+          python script.py
+
+      - name: Upload PDF as artifact
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: food-guide-pdf
+          path: '*.pdf'
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Commit PDF back to main
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -f *.pdf
+          if git diff --cached --quiet; then
+            echo "PDF 无变化，跳过 commit"
+          else
+            git commit -m "ci: rebuild PDF [skip ci]"
+            git push
+          fi
