@@ -9,9 +9,9 @@ type: 堂食          # 堂食 / 外卖 / 都可以
 where:              # 线下店写位置，外卖写平台
 by:                 # 推荐人（可选）
 date:               # 年-月-日（可选）
-figure:             # 图片文件名，放在 figures/ 下（可选）
-figure_caption:     # 图注（可选）
-figure_width: 8cm
+figure:             # 图片文件名，逗号分隔多图，放在 figures/ 下（可选）
+figure_caption:     # 图注，| 分隔每图一条；只填一条则所有图共用（可选）
+figure_width: 8cm   # 宽度，| 分隔每图一条；只填一条则所有图共用
 status: active      # active / retired
 retired_note:       # 停止推荐时写：日期，原因
 ---

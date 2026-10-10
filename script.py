@@ -639,17 +639,32 @@ def card_markdown(fm: Dict[str, str], body: str, show_no: bool = True) -> str:
     return "\n".join(lines)
 
 
-def card_with_figure_markdown(fm: Dict[str, str], body: str, show_no: bool, fig_no: int) -> str:
+def card_with_figure_markdown(fm: Dict[str, str], body: str, show_no: bool, fig_counter: List[int]) -> str:
+    """Render a card; supports comma-separated `figure:` for multiple images.
+
+    figure:          a.jpg,b.jpg            (comma-separated)
+    figure_caption:  cap1|cap2              (| -separated, one per figure;
+                                            if only one, all figures share it)
+    figure_width:    8cm|6cm                (| -separated; if only one, all share)
+    """
     card = card_markdown(fm, body, show_no)
     parts = [card]
-    if fm.get("figure"):
+    figs_raw = (fm.get("figure") or "").strip()
+    if not figs_raw:
+        return "\n".join(parts)
+    names = [x.strip() for x in figs_raw.split(",") if x.strip()]
+    if not names:
+        return "\n".join(parts)
+    caps_raw = (fm.get("figure_caption") or "").strip()
+    caps = [x.strip() for x in caps_raw.split("|")] if caps_raw else []
+    widths_raw = (fm.get("figure_width") or "").strip()
+    widths = [x.strip() for x in widths_raw.split("|")] if widths_raw else []
+    for i, name in enumerate(names):
+        fig_counter[0] += 1
+        cap = caps[i] if i < len(caps) else (caps[0] if caps else "")
+        width = widths[i] if i < len(widths) else (widths[0] if widths else "")
         parts.append("")
-        parts.append(figure_html_tag(
-            fm["figure"],
-            fm.get("figure_width", ""),
-            fm.get("figure_caption", ""),
-            fig_no,
-        ))
+        parts.append(figure_html_tag(name, width, cap, fig_counter[0]))
     return "\n".join(parts)
 
 
@@ -661,8 +676,7 @@ def examples_markdown(fig_counter: List[int]) -> str:
             continue
         fm, body = read_front_matter(p)
         parts.append("\n### %s\n" % fm.get("heading", p.stem))
-        fig_counter[0] += 1
-        parts.append(card_with_figure_markdown(fm, body, show_no, fig_counter[0]))
+        parts.append(card_with_figure_markdown(fm, body, show_no, fig_counter))
     return "\n".join(parts)
 
 
@@ -679,8 +693,7 @@ def entries_markdown(fig_counter: List[int]) -> str:
         parts.append("\n【新的推荐从这里开始，按编号往后追加。】\n")
     for p in files:
         fm, body = read_front_matter(p)
-        fig_counter[0] += 1
-        parts.append(card_with_figure_markdown(fm, body, True, fig_counter[0]))
+        parts.append(card_with_figure_markdown(fm, body, True, fig_counter))
     return "\n".join(parts)
 
 
@@ -1153,18 +1166,29 @@ def new_entry(name: str) -> int:
             nums.append(int(fm["no"]))
     no = max(nums) + 1 if nums else 1
     path = ENTRIES_DIR / ("%04d.md" % no)
-    path.write_text(
-        "---\n"
-        "no: %d\n"
-        "name: %s\n"
-        "type: 堂食\n"
-        "where:\n"
-        "by:\n"
-        "date: %s\n"
-        "---\n"
-        "点评：\n" % (no, name, datetime.date.today().isoformat()),
-        encoding="utf-8",
-    )
+    # Render from _template.md so new entries pick up template changes automatically.
+    tpl = ENTRIES_DIR / "_template.md"
+    tpl_text = tpl.read_text(encoding="utf-8") if tpl.exists() else ""
+    if tpl_text:
+        # Replace front-matter values, preserving comments and field order.
+        # _template.md uses `no: 0` and `name: 店名` as placeholders.
+        text = re.sub(r'(?m)^no:.*$', 'no: %d' % no, tpl_text)
+        text = re.sub(r'(?m)^name:.*$', 'name: %s' % name, text)
+        text = re.sub(r'(?m)^date:.*$', 'date: %s' % datetime.date.today().isoformat(), text)
+        path.write_text(text, encoding="utf-8")
+    else:
+        path.write_text(
+            "---\n"
+            "no: %d\n"
+            "name: %s\n"
+            "type: 堂食\n"
+            "where:\n"
+            "by:\n"
+            "date: %s\n"
+            "---\n"
+            "点评：\n" % (no, name, datetime.date.today().isoformat()),
+            encoding="utf-8",
+        )
     print("Created %s  (see entries/_template.md for all fields)" % path.relative_to(ROOT))
     return 0
 
